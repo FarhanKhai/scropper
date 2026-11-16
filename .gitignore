@@ -1,0 +1,9 @@
+.toolchain/
+env.sh
+target/
+build/
+.gradle/
+local.properties
+android/app/src/main/jniLibs/
+*.iml
+.idea/
