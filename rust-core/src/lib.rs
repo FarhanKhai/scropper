@@ -1,8 +1,10 @@
 //! Scropper core: network blocker, Shorts URL rewriter, DOM eraser payload generator.
 //! Pure logic lives at the top level; the JNI surface is in `jni_bridge`.
 
+pub mod ads;
+
 const INJECT_TEMPLATE: &str = include_str!("inject.js");
-const PAYLOAD_VERSION: u32 = 1;
+const PAYLOAD_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // URL helpers
@@ -163,6 +165,22 @@ const IG_EXPLORE_CSS: &str = concat!(
     "{display:none!important}"
 );
 
+/// Belt and braces next to the uBlock Origin cosmetic filters: YouTube mobile ad containers.
+const YT_ADS_CSS: &str = concat!(
+    "ytm-promoted-sparkles-web-renderer,",
+    "ytm-promoted-sparkles-text-search-renderer,",
+    "ytm-promoted-video-renderer,",
+    "ytm-companion-ad-renderer,",
+    "ytm-companion-slot,",
+    "ytm-in-feed-ad-layout-renderer,",
+    "ytm-ad-slot-renderer,",
+    "ad-slot-renderer,",
+    "ytm-rich-item-renderer:has(ad-slot-renderer),",
+    "ytm-rich-item-renderer:has(ytm-ad-slot-renderer),",
+    "ytm-item-section-renderer:has(> lazy-list > ad-slot-renderer:only-child)",
+    "{display:none!important}"
+);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Site {
     Youtube,
@@ -189,7 +207,7 @@ impl Site {
     }
 }
 
-fn js_string(s: &str) -> String {
+pub(crate) fn js_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -213,18 +231,23 @@ pub fn get_injection_script(
     block_yt_shorts: bool,
     block_ig_reels: bool,
     block_ig_explore: bool,
+    block_ads: bool,
 ) -> String {
     let Some(site) = Site::parse(site) else {
         return String::new();
     };
+    let ads = block_ads;
     let (shorts, reels, explore) = match site {
         Site::Youtube => (block_yt_shorts, false, false),
         Site::Instagram => (false, block_ig_reels, block_ig_explore),
     };
 
     let mut css = String::new();
-    if shorts || reels || explore {
+    if shorts || reels || explore || ads {
         css.push_str(BASE_CSS);
+    }
+    if ads && site == Site::Youtube {
+        css.push_str(YT_ADS_CSS);
     }
     if shorts {
         css.push_str(YT_SHORTS_CSS);
@@ -237,11 +260,12 @@ pub fn get_injection_script(
     }
 
     let key = format!(
-        "v{PAYLOAD_VERSION}:{}:{}{}{}",
+        "v{PAYLOAD_VERSION}:{}:{}{}{}{}",
         site.name(),
         shorts as u8,
         reels as u8,
-        explore as u8
+        explore as u8,
+        ads as u8
     );
 
     INJECT_TEMPLATE
@@ -251,6 +275,7 @@ pub fn get_injection_script(
         .replace("__SHORTS__", if shorts { "true" } else { "false" })
         .replace("__REELS__", if reels { "true" } else { "false" })
         .replace("__EXPLORE__", if explore { "true" } else { "false" })
+        .replace("__ADS__", if ads { "true" } else { "false" })
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +283,8 @@ pub fn get_injection_script(
 // ---------------------------------------------------------------------------
 
 mod jni_bridge {
-    use jni::objects::{JClass, JString};
-    use jni::sys::{jboolean, jstring};
+    use jni::objects::{JByteArray, JClass, JString};
+    use jni::sys::{jboolean, jbyteArray, jstring};
     use jni::JNIEnv;
 
     fn read(env: &mut JNIEnv, s: &JString) -> String {
@@ -314,6 +339,7 @@ mod jni_bridge {
         block_yt_shorts: jboolean,
         block_ig_reels: jboolean,
         block_ig_explore: jboolean,
+        block_ads: jboolean,
     ) -> jstring {
         let site = read(&mut env, &site);
         let script = super::get_injection_script(
@@ -321,8 +347,78 @@ mod jni_bridge {
             block_yt_shorts != 0,
             block_ig_reels != 0,
             block_ig_explore != 0,
+            block_ads != 0,
         );
         env.new_string(script)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    fn read_bytes(env: &mut JNIEnv, bytes: &JByteArray) -> Vec<u8> {
+        if bytes.is_null() {
+            return Vec::new();
+        }
+        env.convert_byte_array(bytes).unwrap_or_default()
+    }
+
+    fn read_text(env: &mut JNIEnv, bytes: &JByteArray) -> String {
+        String::from_utf8_lossy(&read_bytes(env, bytes)).into_owned()
+    }
+
+    /// Builds the ad-block engine from UTF-8 list text. Returns the serialized engine to cache.
+    #[no_mangle]
+    pub extern "system" fn Java_com_scropper_app_RustCore_adblockLoadLists<'l>(
+        mut env: JNIEnv<'l>,
+        _class: JClass<'l>,
+        trusted_lists: JByteArray<'l>,
+        untrusted_lists: JByteArray<'l>,
+        resources_json: JByteArray<'l>,
+    ) -> jbyteArray {
+        let trusted = read_text(&mut env, &trusted_lists);
+        let untrusted = read_text(&mut env, &untrusted_lists);
+        let resources = read_text(&mut env, &resources_json);
+        let serialized = super::ads::load_from_lists(&trusted, &untrusted, &resources);
+        env.byte_array_from_slice(&serialized)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_scropper_app_RustCore_adblockLoadCache<'l>(
+        mut env: JNIEnv<'l>,
+        _class: JClass<'l>,
+        serialized: JByteArray<'l>,
+        resources_json: JByteArray<'l>,
+    ) -> jboolean {
+        let serialized = read_bytes(&mut env, &serialized);
+        let resources = read_text(&mut env, &resources_json);
+        super::ads::load_from_cache(&serialized, &resources) as jboolean
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_scropper_app_RustCore_adblockShouldBlock<'l>(
+        mut env: JNIEnv<'l>,
+        _class: JClass<'l>,
+        url: JString<'l>,
+        source_url: JString<'l>,
+        request_type: JString<'l>,
+        method: JString<'l>,
+    ) -> jboolean {
+        let url = read(&mut env, &url);
+        let source_url = read(&mut env, &source_url);
+        let request_type = read(&mut env, &request_type);
+        let method = read(&mut env, &method);
+        super::ads::should_block(&url, &source_url, &request_type, &method) as jboolean
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_scropper_app_RustCore_adblockCosmeticScript<'l>(
+        mut env: JNIEnv<'l>,
+        _class: JClass<'l>,
+        url: JString<'l>,
+    ) -> jstring {
+        let url = read(&mut env, &url);
+        env.new_string(super::ads::cosmetic_script(&url))
             .map(|s| s.into_raw())
             .unwrap_or(std::ptr::null_mut())
     }
@@ -537,7 +633,7 @@ mod tests {
     // --- injection payload --------------------------------------------------
 
     fn no_placeholders(script: &str) {
-        for p in ["__KEY__", "__SITE__", "__CSS__", "__SHORTS__", "__REELS__", "__EXPLORE__"] {
+        for p in ["__KEY__", "__SITE__", "__CSS__", "__SHORTS__", "__REELS__", "__EXPLORE__", "__ADS__"] {
             assert!(!script.contains(p), "unreplaced placeholder {p}");
         }
     }
@@ -554,7 +650,7 @@ mod tests {
 
     #[test]
     fn youtube_payload_hides_shorts() {
-        let s = get_injection_script("youtube", true, true, true);
+        let s = get_injection_script("youtube", true, true, true, false);
         no_placeholders(&s);
         balanced(&s);
         for needle in [
@@ -582,7 +678,7 @@ mod tests {
 
     #[test]
     fn instagram_payload_hides_reels_and_explore() {
-        let s = get_injection_script("instagram", true, true, true);
+        let s = get_injection_script("instagram", true, true, true, false);
         no_placeholders(&s);
         balanced(&s);
         for needle in [
@@ -604,12 +700,12 @@ mod tests {
 
     #[test]
     fn instagram_explore_is_optional() {
-        let s = get_injection_script("instagram", true, true, false);
+        let s = get_injection_script("instagram", true, true, false, false);
         assert!(s.contains("reels: true"));
         assert!(s.contains("explore: false"));
         assert!(!s.contains("html[data-scropper-explore] main"));
 
-        let s = get_injection_script("instagram", true, false, true);
+        let s = get_injection_script("instagram", true, false, true, false);
         assert!(s.contains("reels: false"));
         assert!(s.contains("explore: true"));
         assert!(s.contains("html[data-scropper-explore] main"));
@@ -618,19 +714,19 @@ mod tests {
 
     #[test]
     fn instagram_payload_never_targets_dms_or_stories() {
-        let s = get_injection_script("instagram", true, true, true);
+        let s = get_injection_script("instagram", true, true, true, false);
         assert!(!s.contains("/direct"));
         assert!(!s.contains("/stories"));
     }
 
     #[test]
     fn toggles_off_yield_teardown_only_payload() {
-        let yt = get_injection_script("youtube", false, true, true);
+        let yt = get_injection_script("youtube", false, true, true, false);
         no_placeholders(&yt);
         assert!(yt.contains(r#"css: """#));
         assert!(yt.contains("shorts: false"));
 
-        let ig = get_injection_script("instagram", true, false, false);
+        let ig = get_injection_script("instagram", true, false, false, false);
         assert!(ig.contains(r#"css: """#));
         assert!(ig.contains("reels: false"));
         assert!(ig.contains("explore: false"));
@@ -638,33 +734,50 @@ mod tests {
 
     #[test]
     fn payload_key_changes_with_toggles() {
-        let a = get_injection_script("instagram", false, true, false);
-        let b = get_injection_script("instagram", false, true, true);
-        let c = get_injection_script("instagram", true, true, false);
+        let a = get_injection_script("instagram", false, true, false, false);
+        let b = get_injection_script("instagram", false, true, true, false);
+        let c = get_injection_script("instagram", true, true, false, false);
         assert_ne!(a, b);
         // YouTube toggle is irrelevant to the Instagram payload.
         assert_eq!(a, c);
-        assert!(a.contains(r#"key: "v1:instagram:010""#));
-        assert!(b.contains(r#"key: "v1:instagram:011""#));
+        assert!(a.contains(r#"key: "v2:instagram:0100""#));
+        assert!(b.contains(r#"key: "v2:instagram:0110""#));
+    }
+
+    #[test]
+    fn ads_flag_adds_ad_handling() {
+        let yt = get_injection_script("youtube", false, false, false, true);
+        no_placeholders(&yt);
+        balanced(&yt);
+        assert!(yt.contains("ads: true"));
+        assert!(yt.contains("ad-slot-renderer"));
+        assert!(yt.contains("ad-showing"));
+        let ig = get_injection_script("instagram", false, false, false, true);
+        assert!(ig.contains("ads: true"));
+        assert!(ig.contains("Sponsored"));
+        assert!(!ig.contains("ad-slot-renderer,"));
+        let off = get_injection_script("youtube", true, false, false, false);
+        assert!(off.contains("ads: false"));
+        assert!(!off.contains("ad-slot-renderer,"));
     }
 
     #[test]
     fn site_accepts_names_and_hosts() {
         assert_eq!(
-            get_injection_script("m.youtube.com", true, false, false),
-            get_injection_script("youtube", true, false, false)
+            get_injection_script("m.youtube.com", true, false, false, false),
+            get_injection_script("youtube", true, false, false, false)
         );
         assert_eq!(
-            get_injection_script("WWW.INSTAGRAM.COM", false, true, true),
-            get_injection_script("instagram", false, true, true)
+            get_injection_script("WWW.INSTAGRAM.COM", false, true, true, false),
+            get_injection_script("instagram", false, true, true, false)
         );
-        assert_eq!(get_injection_script("example.com", true, true, true), "");
-        assert_eq!(get_injection_script("", true, true, true), "");
+        assert_eq!(get_injection_script("example.com", true, true, true, false), "");
+        assert_eq!(get_injection_script("", true, true, true, false), "");
     }
 
     #[test]
     fn payload_is_idempotent_iife() {
-        let s = get_injection_script("youtube", true, false, false);
+        let s = get_injection_script("youtube", true, false, false, false);
         assert!(s.trim_start().starts_with("(function"));
         assert!(s.trim_end().ends_with("})();"));
         assert!(s.contains("window.__scropper"));

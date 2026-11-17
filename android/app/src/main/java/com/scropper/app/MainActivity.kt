@@ -2,10 +2,13 @@ package com.scropper.app
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Bundle
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.ValueCallback
@@ -51,6 +54,8 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.systemGestureExclusion
@@ -129,6 +134,8 @@ class MainActivity : ComponentActivity(), WebHost {
         // Both WebViews are created once and live as long as the activity.
         controllers = Site.entries.map { ScropperWebController(this, it, settings, this) }
         handleIntent(intent)
+        // With ad blocking on, pages wait for the engine so the very first load is already filtered.
+        if (settings.config.blockAds) startAdBlock() else controllers.forEach { it.start() }
 
         setContent {
             MaterialTheme(colorScheme = ScropperColors) {
@@ -179,6 +186,7 @@ class MainActivity : ComponentActivity(), WebHost {
     override fun onDestroy() {
         fileCallback?.onReceiveValue(null)
         fileCallback = null
+        AdBlock.clearListener()
         controllers.forEach { it.destroy() }
         super.onDestroy()
     }
@@ -207,6 +215,16 @@ class MainActivity : ComponentActivity(), WebHost {
         settings.update(transform)
         controllers.forEach { it.applyConfig(settings.config) }
         syncForeground()
+        if (settings.config.blockAds && !AdBlock.ready) startAdBlock()
+    }
+
+    private fun startAdBlock() {
+        AdBlock.start(this) {
+            controllers.forEach {
+                it.applyConfig(settings.config)
+                it.start()
+            }
+        }
     }
 
     private fun handleBack() {
@@ -237,13 +255,24 @@ class MainActivity : ComponentActivity(), WebHost {
             callback.onCustomViewHidden()
             return
         }
-        customView = view
+        val match = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        val container = FullscreenContainer(this).apply {
+            setBackgroundColor(AndroidColor.BLACK)
+            addView(view, match)
+        }
+        customView = container
         customViewCallback = callback
-        view.setBackgroundColor(AndroidColor.BLACK)
-        (window.decorView as FrameLayout).addView(
-            view,
-            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
-        )
+        (window.decorView as FrameLayout).addView(container, match)
+        // Like the YouTube app: the fullscreen button turns the screen for landscape videos,
+        // even with auto-rotate off. Portrait videos stay upright.
+        val current = site
+        controller(current).webView.evaluateJavascript(VIDEO_ASPECT_JS) { result ->
+            val aspect = result?.toFloatOrNull() ?: 0f
+            val landscape = aspect > 1f || (aspect == 0f && current == Site.YOUTUBE)
+            if (customView != null && landscape) {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+        }
         WindowCompat.getInsetsController(window, window.decorView).apply {
             systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
             hide(WindowInsetsCompat.Type.systemBars())
@@ -252,9 +281,11 @@ class MainActivity : ComponentActivity(), WebHost {
 
     override fun hideCustomView() {
         val view = customView ?: return
+        (view as? ViewGroup)?.removeAllViews()
         (window.decorView as FrameLayout).removeView(view)
         customView = null
         customViewCallback = null
+        requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         WindowCompat.getInsetsController(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
     }
 
@@ -276,7 +307,42 @@ class MainActivity : ComponentActivity(), WebHost {
     private companion object {
         const val KEY_HANDLE_Y = "handle_y"
         const val KEY_SITE = "last_site"
+        const val VIDEO_ASPECT_JS =
+            "(function(){var v=document.querySelector('video');" +
+                "return v&&v.videoWidth&&v.videoHeight?v.videoWidth/v.videoHeight:0})()"
     }
+}
+
+/**
+ * Hosts the fullscreen video. A downward swipe that starts at the top edge is meant for the
+ * status bar; it is taken away from the page so the site's own "swipe down to leave fullscreen"
+ * gesture doesn't fire. Taps and other gestures pass through.
+ */
+private class FullscreenContainer(context: Context) : FrameLayout(context) {
+    private val topZone = 40 * resources.displayMetrics.density
+    private val slop = ViewConfiguration.get(context).scaledTouchSlop
+    private var downX = 0f
+    private var downY = 0f
+    private var guarded = false
+    private var stolen = false
+
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = ev.x
+                downY = ev.y
+                guarded = ev.y < topZone
+                stolen = false
+            }
+            MotionEvent.ACTION_MOVE -> if (guarded && !stolen) {
+                val dy = ev.y - downY
+                if (dy > slop && dy > abs(ev.x - downX)) stolen = true
+            }
+        }
+        return stolen
+    }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean = stolen
 }
 
 // --- UI -------------------------------------------------------------------------------------------
@@ -572,6 +638,7 @@ private fun SettingsSheet(
         Column(
             Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .navigationBarsPadding()
                 .padding(start = 24.dp, end = 24.dp, bottom = 24.dp),
         ) {
@@ -584,6 +651,11 @@ private fun SettingsSheet(
             Text("Choose what Scropper removes.", color = Muted, fontSize = 14.sp)
             Spacer(Modifier.height(12.dp))
 
+            ToggleRow(
+                "Block Ads",
+                "YouTube video and feed ads, Instagram sponsored posts, trackers. Filters update daily.",
+                config.blockAds,
+            ) { v -> onConfig { it.copy(blockAds = v) } }
             ToggleRow(
                 "Hide YouTube Shorts",
                 "Shorts tab, shelves and results. Shorts links open as normal videos.",

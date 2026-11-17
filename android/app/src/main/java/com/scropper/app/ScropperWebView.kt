@@ -99,7 +99,13 @@ class ScropperWebController(
     @Volatile
     private var innerScrolled = false
     private var docStartHandler: ScriptHandler? = null
+    private var adsHandler: ScriptHandler? = null
     private var paused = false
+    private var started = false
+
+    /** URL of the page currently showing, for ad-filter context. Read from WebView IO threads. */
+    @Volatile
+    private var pageUrl: String = site.homeUrl
 
     init {
         configure(webView)
@@ -115,6 +121,12 @@ class ScropperWebController(
         root.setOnRefreshListener { webView.reload() }
 
         applyConfig(settings.config)
+    }
+
+    /** Loads the home page unless something (e.g. a shared link) was loaded already. */
+    fun start() {
+        if (started) return
+        started = true
         webView.loadUrl(site.homeUrl)
     }
 
@@ -169,8 +181,10 @@ class ScropperWebController(
 
     private fun script(): String {
         val c = settings.config
-        return RustCore.getInjectionScript(site.key, c.hideYtShorts, c.hideIgReels, c.hideIgExplore)
+        return RustCore.getInjectionScript(site.key, c.hideYtShorts, c.hideIgReels, c.hideIgExplore, c.blockAds)
     }
+
+    private fun adsActive() = settings.config.blockAds && AdBlock.ready
 
     private fun inject(view: WebView, url: String?) {
         if (Site.forUrl(url) != site) return
@@ -188,6 +202,15 @@ class ScropperWebController(
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             docStartHandler?.remove()
             docStartHandler = WebViewCompat.addDocumentStartJavaScript(webView, script(), site.originRules)
+            // uBlock Origin scriptlets must run before the page's own scripts to strip video ads.
+            adsHandler?.remove()
+            adsHandler = null
+            if (adsActive()) {
+                val ads = AdBlock.cosmeticScript(site.homeUrl)
+                if (ads.isNotEmpty()) {
+                    adsHandler = WebViewCompat.addDocumentStartJavaScript(webView, ads, site.originRules)
+                }
+            }
         }
         // Live page: same script reconfigures (or tears down) the already-installed observer.
         inject(webView, webView.url)
@@ -209,6 +232,7 @@ class ScropperWebController(
     }
 
     fun load(url: String) {
+        started = true
         val target = if (settings.config.hideYtShorts) RustCore.rewriteNavigationUrl(url) ?: url else url
         webView.loadUrl(target)
     }
@@ -217,6 +241,7 @@ class ScropperWebController(
 
     fun destroy() {
         docStartHandler?.remove()
+        adsHandler?.remove()
         (webView.parent as? ViewGroup)?.removeView(webView)
         webView.destroy()
     }
@@ -266,20 +291,33 @@ class ScropperWebController(
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             if (request.isForMainFrame) return null
             val c = settings.config
-            if (!c.hideYtShorts && !c.hideIgReels && !c.hideIgExplore) return null
             val uri = request.url
-            val block = RustCore.shouldBlockUrl(
-                uri.toString(),
-                uri.host.orEmpty(),
-                c.hideYtShorts,
-                c.hideIgReels,
-                c.hideIgExplore,
-            )
-            return if (block) emptyResponse() else null
+            val url = uri.toString()
+            if (c.hideYtShorts || c.hideIgReels || c.hideIgExplore) {
+                val block = RustCore.shouldBlockUrl(url, uri.host.orEmpty(), c.hideYtShorts, c.hideIgReels, c.hideIgExplore)
+                if (block) return emptyResponse()
+            }
+            // Ad filters only on the site's own pages: sign-in pages of other hosts stay untouched.
+            val page = pageUrl
+            if (c.blockAds && AdBlock.ready && Site.forUrl(page) == site) {
+                if (RustCore.adblockShouldBlock(url, page, requestType(request), request.method ?: "GET")) {
+                    return emptyResponse()
+                }
+            }
+            return null
+        }
+
+        override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+            if (url != null) pageUrl = url
         }
 
         override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
             innerScrolled = false
+            if (url != null) pageUrl = url
+            // Without document-start support this is the earliest point to add the ad scriptlets.
+            if (adsHandler == null && adsActive() && Site.forUrl(url) == site) {
+                AdBlock.cosmeticScript(url!!).takeIf { it.isNotEmpty() }?.let { view.evaluateJavascript(it, null) }
+            }
             inject(view, url)
         }
 
@@ -325,6 +363,35 @@ class ScropperWebController(
             WebSettings.getDefaultUserAgent(context)
                 .replace("; wv", "")
                 .replace(Regex("""\s*Version/\d+(\.\d+)*"""), "")
+
+        private val IMAGE_EXT = setOf("png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "avif")
+        private val MEDIA_EXT = setOf("mp4", "webm", "m4a", "m4s", "mp3", "ts", "m3u8", "mpd")
+        private val FONT_EXT = setOf("woff", "woff2", "ttf", "otf")
+
+        /** WebView doesn't expose the resource type, so infer it for `$script`/`$image`/`$xhr` filters. */
+        fun requestType(request: WebResourceRequest): String {
+            val headers = request.requestHeaders
+            when (headers?.get("Sec-Fetch-Dest") ?: headers?.get("sec-fetch-dest")) {
+                "script" -> return "script"
+                "image" -> return "image"
+                "style" -> return "stylesheet"
+                "iframe", "frame" -> return "sub_frame"
+                "video", "audio" -> return "media"
+                "font" -> return "font"
+                "empty" -> return "xmlhttprequest"
+            }
+            val ext = request.url.lastPathSegment?.substringAfterLast('.', "")?.lowercase().orEmpty()
+            val accept = (headers?.get("Accept") ?: headers?.get("accept")).orEmpty()
+            return when {
+                ext == "js" || ext == "mjs" -> "script"
+                ext == "css" || accept.startsWith("text/css") -> "stylesheet"
+                ext in IMAGE_EXT || accept.startsWith("image/") -> "image"
+                ext in MEDIA_EXT -> "media"
+                ext in FONT_EXT -> "font"
+                accept.startsWith("text/html") -> "sub_frame"
+                else -> "xmlhttprequest"
+            }
+        }
 
         fun emptyResponse() = WebResourceResponse(
             "text/plain",

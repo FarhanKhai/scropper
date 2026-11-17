@@ -8,6 +8,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 jni = "0.21"
+serde_json = "1"
+# No `single-thread` feature: the engine is shared across WebView IO threads.
+adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
 
 [profile.release]
 opt-level = "z"

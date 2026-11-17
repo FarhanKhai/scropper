@@ -10,6 +10,8 @@ Scropper wraps the mobile websites (`m.youtube.com`, `instagram.com`) in a nativ
 - **Shorts → normal video**: any `youtube.com/shorts/<id>` link (shared or tapped) opens as a regular `watch?v=<id>` player you can't swipe out of.
 - **Reels blocker**: hides the Reels tab and Reels posts in the Instagram feed, and blocks the Reels/Clips APIs. Stories, DMs, the feed and profile tabs are explicitly allowed.
 - **Explore grid blocker** (optional): empties the Explore recommendation grid while keeping the search bar usable.
+- **Ad blocker**: Brave's open-source [`adblock-rust`](https://github.com/brave/adblock-rust) engine running uBlock Origin's filter lists and scriptlets, all on the device. Strips YouTube video ads from the player data before playback, hides promoted cards and Instagram sponsored posts, and blocks ad and tracker requests. Lists refresh daily.
+- **Fullscreen like the app**: the fullscreen button rotates landscape videos to landscape, even with auto-rotate off.
 - **Two persistent WebViews**: YouTube and Instagram stay alive in memory, so switching between them is instant and keeps scroll position and playback.
 - **Edge handle UI**: no navigation bar. A thin pill on the right screen edge opens a floating switcher (YouTube / Instagram / Shield). Drag it to reposition.
 - **Background audio** (optional): YouTube keeps playing when you switch apps or tabs.
@@ -29,6 +31,7 @@ Scropper wraps the mobile websites (`m.youtube.com`, `instagram.com`) in a nativ
 │  should_block_url        network-level blocker (empty 204 response)           │
 │  rewrite_navigation_url  /shorts/<id> → /watch?v=<id>                         │
 │  get_injection_script    CSS + rAF-throttled MutationObserver per site        │
+│  ads                     adblock-rust engine: request filter + scriptlets     │
 └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -49,7 +52,11 @@ android/          Gradle project, package com.scropper.app (minSdk 26, targetSdk
     MainActivity.kt      UI: edge handle, switcher panel, settings sheet
     ScropperWebView.kt   WebView setup, clients, dual-WebView stack
     ShieldSettings.kt    SharedPreferences-backed toggles
+    AdBlock.kt           loads, caches and updates the ad-block engine
     RustCore.kt          JNI declarations
+  app/src/main/assets/adblock/   bundled filter lists + uBlock Origin scriptlets (resources.json)
+scripts/
+  gen_adblock_resources.py  builds resources.json from uBlock Origin's scriptlet sources
 ```
 
 ## Building
@@ -114,6 +121,16 @@ Only `arm64-v8a` is built, which covers nearly all current phones. Emulators on 
 - **Back**: the system Back gesture navigates inside the current site. Back on the site's first page sends Scropper to the background.
 - **Pull to refresh**: works when the page is scrolled to the top.
 
+## Ad blocking
+
+How it works:
+
+1. **Network**: every sub-request on YouTube and Instagram pages is checked against uBlock filters, uBlock quick fixes, uBlock privacy and Peter Lowe's ad server list.
+2. **Scriptlets**: uBlock Origin's `+js(...)` filters are injected at document start, before the page's own scripts. On YouTube these remove ad fields (`adPlacements`, `playerAds`, `adSlots`) from player responses.
+3. **Cosmetic**: CSS hides promoted cards and banners. A fallback skips any video ad that still starts.
+
+Everything runs locally. No request goes to Brave or uBlock Origin except the daily download of the public filter lists. Ad blocking is against YouTube's terms of service; YouTube may show an "ad blockers are not allowed" prompt. Turn off *Block Ads* in Shield if a page misbehaves.
+
 ## Known limitations
 
 - Scropper is the **mobile website**, not the official app. There are no push notifications, no downloads, no calls, and Instagram posting is more limited than in the app.
@@ -125,17 +142,12 @@ Only `arm64-v8a` is built, which covers nearly all current phones. Emulators on 
 
 ## Future work
 
-### Ad blocking for YouTube and Instagram
+### Ad blocking follow-ups
 
-Every request already goes through Rust's `should_block_url`, so ad blocking fits the existing design.
-
-- **Network ad and tracker blocking**: embed Brave's [`adblock-rust`](https://github.com/brave/adblock-rust) engine in `rust-core`, with EasyList and EasyPrivacy bundled. That covers DoubleClick, Google ad services, analytics and the Meta pixel.
-- **YouTube video ads**: these come from the same servers as normal videos, so host blocking can't stop them. The plan is a document-start script that removes ad fields (`adPlacements`, `playerAds`, `adSlots`) from player responses before the page reads them, the same approach uBlock Origin takes. As a fallback, skip or fast-forward any ad that still plays. Expect this to need maintenance, because YouTube actively changes its ad delivery.
-- **YouTube cosmetic ads**: hide promoted video cards, banner ads and "Sponsored" results with CSS.
-- **Instagram sponsored posts**: hide feed posts and Stories labelled *Sponsored*, using the same rAF-throttled observer as the Reels blocker.
-- **Shield toggle**: a *Block Ads* switch in Shield settings, with matching unit tests in `rust-core`.
-
-Note that ad blocking breaks YouTube's terms of service. YouTube may respond with an "ad blockers are not allowed" prompt.
+- **Scriptlet updates**: filter lists update daily in the app, but the scriptlets in `resources.json` only change with a new build. If uBlock Origin adds a scriptlet that newer filters depend on, regenerate with `scripts/gen_adblock_resources.py` and rebuild. Hosting a generated copy for the app to download would remove that step.
+- **Redirect resources**: `$redirect` filters currently just block. uBlock Origin's neutered replacement files are not bundled.
+- **Procedural cosmetic filters** (`:has-text()`, `:upward()` and similar) are skipped; only plain CSS filters are applied.
+- **Instagram sponsored posts** are detected by their "Sponsored" label in a handful of languages. A language-independent signal would be more robust.
 
 ### Other ideas
 

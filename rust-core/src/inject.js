@@ -1,6 +1,6 @@
 (function () {
   'use strict';
-  var CFG = { key: __KEY__, site: __SITE__, css: __CSS__, shorts: __SHORTS__, reels: __REELS__, explore: __EXPLORE__ };
+  var CFG = { key: __KEY__, site: __SITE__, css: __CSS__, shorts: __SHORTS__, reels: __REELS__, explore: __EXPLORE__, ads: __ADS__ };
   var prev = window.__scropper;
   if (prev && prev.key === CFG.key) { prev.sweep(); return; }
   if (prev) { try { prev.stop(); } catch (_) {} }
@@ -37,7 +37,21 @@
     if (s.textContent !== CFG.css) s.textContent = CFG.css;
   }
 
+  // Fallback for a video ad that got past the scriptlets: skip it, or jump to its end.
+  function skipVideoAd() {
+    var player = document.querySelector('.html5-video-player.ad-showing, .ad-showing');
+    if (!player) return;
+    var skip = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
+    if (skip) { skip.click(); return; }
+    var v = player.querySelector('video') || document.querySelector('video');
+    if (v && isFinite(v.duration) && v.duration > 0 && v.currentTime < v.duration - 0.2) {
+      v.muted = true;
+      v.currentTime = v.duration;
+    }
+  }
+
   function sweepYoutube() {
+    if (CFG.ads) skipVideoAd();
     if (!CFG.shorts) return;
     var m = location.pathname.match(/^\/shorts\/([A-Za-z0-9_-]+)/);
     if (m) { location.replace('/watch?v=' + m[1]); return; }
@@ -63,8 +77,20 @@
     if (de && de.hasAttribute(EXP)) de.removeAttribute(EXP);
     each('[' + EXP_HID + ']', function (el) { el.removeAttribute(EXP_HID); });
   }
+  var SPONSORED = /^(sponsored|bersponsor|disponsori|gesponsert|patrocinado|publicidad|sponsoris\u00e9|sponsorizzato)$/i;
+  function isSponsored(article) {
+    var spans = article.querySelectorAll('span, a');
+    var n = Math.min(spans.length, 60);
+    for (var i = 0; i < n; i++) {
+      var t = spans[i].textContent;
+      if (t && t.length < 16 && SPONSORED.test(t.trim())) return true;
+    }
+    return false;
+  }
+
   function sweepInstagram() {
     var p = location.pathname;
+    if (CFG.ads) each('article', function (ar) { if (!ar.hasAttribute(HID) && isSponsored(ar)) hide(ar); });
     if (CFG.reels) {
       if (/^\/reels(\/|$)/.test(p)) { location.replace('/'); return; }
       each('a[href*="/reels"]', function (a) { hide(a); });
@@ -116,6 +142,7 @@
 
   function stop() {
     stopped = true;
+    if (adTimer) clearInterval(adTimer);
     observer.disconnect();
     EVENTS.forEach(function (n) { window.removeEventListener(n, schedule, true); });
     document.removeEventListener('touchstart', onTouch, { capture: true });
@@ -124,6 +151,9 @@
     each('[' + HID + ']', function (el) { el.removeAttribute(HID); });
     clearExplore();
   }
+
+  // Video ads change player classes, not the DOM tree, so the observer alone can miss them.
+  var adTimer = (CFG.ads && CFG.site === 'youtube') ? setInterval(skipVideoAd, 400) : 0;
 
   window.__scropper = { key: CFG.key, sweep: sweep, stop: stop };
   sweep();
